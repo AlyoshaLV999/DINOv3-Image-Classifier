@@ -1,0 +1,13 @@
+numpy~=2.1.2
+torch~=2.11.0+cu128
+typing~=3.7.4.3
+pillow~=12.0.0
+pillow_heif~=1.1.1
+torchvision~=0.26.0+cu128
+peft~=0.20.0
+transformers~=5.14.1
+PyYAML~=6.0.2
+scikit-learn~=1.7.0
+matplotlib~=3.10.3
+tqdm~=4.67.1
+Send2Trash~=2.1.0

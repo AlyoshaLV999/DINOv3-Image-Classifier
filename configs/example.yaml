@@ -1,0 +1,16 @@
+dataset: your_dataset_name
+seed: 42
+data:
+  cache_long_side: 1280
+  input_size: 256
+  num_workers: 2
+train:
+  max_epochs: 50
+  micro_batch: 8
+  grad_accum: 4
+  mixed_precision: true
+  early_stop_patience: 10
+model:
+  name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  lora_rank: 16
+  lora_alpha: 32
