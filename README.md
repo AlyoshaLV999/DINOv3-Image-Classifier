@@ -202,4 +202,4 @@ PyTorch、CUDA AMP、torchvision、Hugging Face Transformers、DINOv3、PEFT/LoR
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE)。公开发布前，请将 `LICENSE` 中的版权占位符替换为你的真实姓名或组织名称。
+本项目采用 [MIT License](LICENSE)。
