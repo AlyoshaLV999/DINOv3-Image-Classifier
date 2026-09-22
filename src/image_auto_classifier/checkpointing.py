@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -50,6 +52,8 @@ REGISTRY_POINTER_NAME = "current.json"
 REGISTRY_VERSIONS_DIRECTORY = "versions"
 REGISTRY_FORMAT_VERSION = 1
 _REGISTRATION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+_logger = logging.getLogger(__name__)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
@@ -202,6 +206,53 @@ def _metadata(
     }
 
 
+def prune_stale_registry_versions(registry_dir: Path) -> None:
+    """Delete every registry version directory that the active pointer does not reference.
+
+    Must be called only after the pointer has been atomically switched to the newest
+    version, so a crash during pruning can at worst leave stale directories behind; it
+    can never remove the version that inference resolves through ``current.json``.
+    The pointer is re-read here rather than trusting the caller's in-memory version,
+    which keeps pruning safe if the pointer was updated concurrently. Stale-version
+    removal is housekeeping only, therefore every failure is logged as a warning and
+    never aborts training (e.g. files briefly locked by a concurrent reader).
+
+    :param registry_dir: Registry root directory, i.e. ``models/<dataset>``.
+    """
+    pointer_path = registry_dir / REGISTRY_POINTER_NAME
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Skip pruning stale registry versions; cannot read pointer %s: %s", pointer_path, error
+        )
+        return
+    active_version = pointer.get("version") if isinstance(pointer, Mapping) else None
+    if not isinstance(active_version, str) or not _REGISTRATION_ID_PATTERN.fullmatch(active_version):
+        _logger.warning("Skip pruning stale registry versions; pointer %s has an invalid schema", pointer_path)
+        return
+    versions_dir = registry_dir / REGISTRY_VERSIONS_DIRECTORY
+    if not versions_dir.is_dir():
+        return
+    try:
+        entries = sorted(versions_dir.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        _logger.warning("Cannot list registry versions in %s: %s", versions_dir, error)
+        return
+    removed = 0
+    for version_path in entries:
+        if not version_path.is_dir() or version_path.name == active_version:
+            continue
+        try:
+            shutil.rmtree(version_path)
+        except OSError as error:
+            _logger.warning("Cannot remove stale registry version %s: %s", version_path, error)
+            continue
+        removed += 1
+    if removed:
+        _logger.info("Pruned %d stale registry version(s); retained %s", removed, active_version)
+
+
 def register_best_model(
     *,
     epoch_checkpoint: Path,
@@ -215,7 +266,14 @@ def register_best_model(
     split_manifest_hash: str,
     task_models_dir: Path,
 ) -> None:
-    """Publish one complete registry version, then atomically switch the active pointer."""
+    """Publish one registry version, atomically switch the pointer, then keep only the newest best.
+
+    Every time validation improves, an immutable version (``versions/<id>/best.ckpt``
+    plus ``metadata.json``) is published and ``current.json`` is atomically repointed at
+    it, so concurrent inference never observes a half-written model. Afterwards every
+    version other than the newly active one is deleted, keeping exactly one best model
+    on disk; historical rollback points are intentionally not retained.
+    """
     task_best = task_models_dir / "best.ckpt"
     atomic_copy(epoch_checkpoint, task_best)
 
@@ -243,7 +301,7 @@ def register_best_model(
             "version": registry_version,
         },
     )
-
+    prune_stale_registry_versions(registry_dir)
 
 
 def validate_metadata(
