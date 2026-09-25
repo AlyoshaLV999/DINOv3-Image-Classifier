@@ -133,12 +133,7 @@ models/<dataset>/
 ```text
 .
 ├── configs/
-│   ├── Tband.yaml
-│   ├── Tgi1.yaml
-│   ├── Thi3.yaml
-│   ├── Thsr1.yaml
-│   ├── Tpixiv1.yaml
-│   └── Tzzz1.yaml
+│   └── task1.yaml
 ├── scripts/
 │   ├── train.py
 │   └── inference.py
@@ -234,7 +229,7 @@ datasets/<dataset>/
 
 ```text
 datasets/
-└── band/
+└── task1/
     ├── character_a/
     │   ├── 001.jpg
     │   └── 002.webp
@@ -280,7 +275,7 @@ cache/<dataset>/
 例如：
 
 ```yaml
-dataset: band
+dataset: task1
 seed: 42
 
 data:
@@ -306,19 +301,19 @@ model:
 例如：
 
 ```text
-configs/Tband.yaml
+configs/task1.yaml
 ```
 
 对应任务名称：
 
 ```text
-Tband
+task1
 ```
 
 其中 `dataset` 字段决定实际使用的数据目录：
 
 ```text
-datasets/band/
+datasets/task1/
 ```
 
 ### 配置项说明
@@ -349,17 +344,13 @@ datasets/band/
 训练一个任务：
 
 ```bash
-python scripts/train.py --config configs/Tband.yaml
+python scripts/train.py --config configs/task1.yaml
 ```
 
 项目中已经提供的其他任务配置可以使用相同方式运行：
 
 ```bash
-python scripts/train.py --config configs/Tgi1.yaml
-python scripts/train.py --config configs/Thi3.yaml
-python scripts/train.py --config configs/Thsr1.yaml
-python scripts/train.py --config configs/Tpixiv1.yaml
-python scripts/train.py --config configs/Tzzz1.yaml
+python scripts/train.py --config configs/task1.yaml
 ```
 
 ### 恢复训练
@@ -368,7 +359,7 @@ python scripts/train.py --config configs/Tzzz1.yaml
 
 ```bash
 python scripts/train.py \
-  --config configs/Tband.yaml \
+  --config configs/task1.yaml \
   --resume auto
 ```
 
@@ -380,11 +371,11 @@ python scripts/train.py \
 
 ### 训练产物
 
-以 `Tband` 为例，任务产物写入：
+以 `task1` 为例，任务产物写入：
 
 ```text
-logs/Tband/
-├── Tband.log
+logs/task1/
+├── task1.log
 ├── curves.png
 ├── split_manifest.jsonl
 └── models/
@@ -412,14 +403,14 @@ input/
 
 ```bash
 python scripts/inference.py \
-  --dataset band \
+  --dataset task1 \
   --input input
 ```
 
 接受的图片会复制到：
 
 ```text
-output/band/<预测标签>/
+output/task1/<预测标签>/
 ```
 
 ### 使用所有已注册模型统一推理
@@ -452,7 +443,7 @@ python scripts/inference.py \
 
 ```bash
 python scripts/inference.py \
-  --dataset band \
+  --dataset task1 \
   --input input \
   --threshold 0.95
 ```
