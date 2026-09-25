@@ -133,12 +133,7 @@ Stale registry versions are removed after publication, so the registry retains t
 ```text
 .
 ├── configs/
-│   ├── Tband.yaml
-│   ├── Tgi1.yaml
-│   ├── Thi3.yaml
-│   ├── Thsr1.yaml
-│   ├── Tpixiv1.yaml
-│   └── Tzzz1.yaml
+│   └── task.yaml
 ├── scripts/
 │   ├── train.py
 │   └── inference.py
@@ -230,7 +225,7 @@ Every first-level directory is treated as one classification tag:
 
 ```text
 datasets/
-└── band/
+└── task1/
     ├── character_a/
     │   ├── 001.jpg
     │   └── 002.webp
@@ -276,7 +271,7 @@ A training task is defined by a YAML file in `configs/`.
 For example:
 
 ```yaml
-dataset: band
+dataset: task1
 seed: 42
 
 data:
@@ -300,19 +295,19 @@ model:
 The configuration filename determines the task name. For example:
 
 ```text
-configs/Tband.yaml
+configs/task1.yaml
 ```
 
 creates the task:
 
 ```text
-Tband
+task1
 ```
 
 while its `dataset` field selects:
 
 ```text
-datasets/band/
+datasets/task1/
 ```
 
 ### Configuration reference
@@ -343,17 +338,13 @@ Run commands from the repository root.
 Train a task:
 
 ```bash
-python scripts/train.py --config configs/Tband.yaml
+python scripts/train.py --config configs/task1.yaml
 ```
 
 Other included task configurations can be started in the same way:
 
 ```bash
-python scripts/train.py --config configs/Tgi1.yaml
-python scripts/train.py --config configs/Thi3.yaml
-python scripts/train.py --config configs/Thsr1.yaml
-python scripts/train.py --config configs/Tpixiv1.yaml
-python scripts/train.py --config configs/Tzzz1.yaml
+python scripts/train.py --config configs/task1.yaml
 ```
 
 ### Resume training
@@ -362,7 +353,7 @@ Resume from the latest epoch checkpoint belonging to the same task:
 
 ```bash
 python scripts/train.py \
-  --config configs/Tband.yaml \
+  --config configs/task1.yaml \
   --resume auto
 ```
 
@@ -374,11 +365,11 @@ When the dataset changes by adding images or classes, training enters a bounded 
 
 ### Training artifacts
 
-A task such as `Tband` writes artifacts under:
+A task such as `task1` writes artifacts under:
 
 ```text
-logs/Tband/
-├── Tband.log
+logs/task1/
+├── task.log
 ├── curves.png
 ├── split_manifest.jsonl
 └── models/
@@ -406,14 +397,14 @@ input/
 
 ```bash
 python scripts/inference.py \
-  --dataset band \
+  --dataset task1 \
   --input input
 ```
 
 Accepted images are copied to:
 
 ```text
-output/band/<predicted-tag>/
+output/task1/<predicted-tag>/
 ```
 
 ### Unified inference across all registered models
@@ -444,7 +435,7 @@ To override it:
 
 ```bash
 python scripts/inference.py \
-  --dataset band \
+  --dataset task1 \
   --input input \
   --threshold 0.95
 ```
