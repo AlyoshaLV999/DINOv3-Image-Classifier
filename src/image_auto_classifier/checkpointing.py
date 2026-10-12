@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -86,6 +87,15 @@ def latest_epoch_checkpoint(models_dir: Path) -> Path | None:
     return max(candidates, default=(0, None), key=lambda value: value[0])[1]
 
 
+def latest_resume_checkpoint(models_dir: Path) -> Path | None:
+    """Choose the newest epoch checkpoint, falling back to the saved best model."""
+    epoch_checkpoint = latest_epoch_checkpoint(models_dir)
+    if epoch_checkpoint is not None:
+        return epoch_checkpoint
+    best_checkpoint = models_dir / "best.ckpt"
+    return best_checkpoint if best_checkpoint.is_file() else None
+
+
 def build_checkpoint(
     *,
     model: MetricArcFaceModel,
@@ -130,9 +140,42 @@ def save_epoch_checkpoint(models_dir: Path, epoch: int, checkpoint: Mapping[str,
     path = models_dir / f"epoch_{epoch:03d}.ckpt"
     atomic_torch_save(path, checkpoint)
     epoch_paths = sorted(models_dir.glob("epoch_*.ckpt"), key=lambda item: item.name)
-    for old_path in epoch_paths[:-3]:
+    for old_path in epoch_paths[:-1]:
         old_path.unlink()
     return path
+
+
+def _atomic_link_or_copy(source: Path, destination: Path) -> None:
+    """Atomically publish ``source`` at ``destination`` preferring a hard link.
+
+    Registration copies two immutable checkpoint blobs. On a single filesystem a
+    hard link is effectively free, whereas the previous byte-for-byte copy of a
+    ~1 GiB ``best.ckpt`` paid visible wall time every time validation improved.
+    Because both endpoints are immutable checkpoint files (never mutated in
+    place), aliasing their inodes is safe: ``atomic_torch_save`` replaces whole
+    files via ``os.replace``, so no reader can ever observe a partial write.
+
+    The publish step uses ``os.replace`` on a temporary name to keep the
+    destination appearing atomically, mirroring ``atomic_copy``. When
+    ``os.link`` fails (cross-device link, unsupported filesystem, permission
+    denied) the call falls back to the previous ``atomic_copy`` behaviour, so
+    existing durability and atomicity guarantees are preserved unchanged.
+
+    :param source: Existing regular file to publish.
+    :param destination: Final path; any existing file will be atomically replaced.
+    :raises OSError: If neither linking nor copying can produce the destination.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        try:
+            os.link(source, temp_path)
+        except OSError:
+            atomic_copy(source, temp_path)
+        os.replace(temp_path, destination)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def registered_model_paths(registry_dir: Path) -> tuple[Path, Path]:
@@ -200,6 +243,7 @@ def _metadata(
             "mean": [0.485, 0.456, 0.406],
             "std": [0.229, 0.224, 0.225],
             "cache_long_side": config.data.cache_long_side,
+            "preserve_aspect_ratio": config.data.preserve_aspect_ratio,
         },
         "model": config.model.__dict__,
         "split_manifest_hash": split_manifest_hash,
@@ -273,14 +317,19 @@ def register_best_model(
     it, so concurrent inference never observes a half-written model. Afterwards every
     version other than the newly active one is deleted, keeping exactly one best model
     on disk; historical rollback points are intentionally not retained.
+
+    The two copies performed here previously dominated the per-epoch tail latency
+    because they duplicated a multi-hundred-megabyte checkpoint blob. They are now
+    published as hard links (see ``_atomic_link_or_copy``), falling back to the
+    original atomic copy when linking is unavailable.
     """
     task_best = task_models_dir / "best.ckpt"
-    atomic_copy(epoch_checkpoint, task_best)
+    _atomic_link_or_copy(epoch_checkpoint, task_best)
 
     registry_dir = project_root / "models" / dataset
     registry_version = f"epoch_{epoch:03d}_{uuid.uuid4().hex}"
     version_dir = registry_dir / REGISTRY_VERSIONS_DIRECTORY / registry_version
-    atomic_copy(task_best, version_dir / "best.ckpt")
+    _atomic_link_or_copy(task_best, version_dir / "best.ckpt")
     atomic_write_json(
         version_dir / "metadata.json",
         _metadata(

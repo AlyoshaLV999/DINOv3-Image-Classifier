@@ -18,6 +18,8 @@ from pillow_heif import register_heif_opener
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision import transforms
 
+from .config import DataConfig
+
 from .common import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -47,7 +49,7 @@ class ManifestItem:
         if set(value) != expected:
             raise ProjectError("split_manifest.jsonl contains an unsupported record")
         item = cls(**value)
-        if item.split not in {"train", "val"}:
+        if item.split not in {"train", "val", "calibration", "test"}:
             raise ProjectError("split_manifest.jsonl contains an invalid split")
         return item
 
@@ -131,6 +133,8 @@ def audit_dataset(
     task_log_dir: Path,
     cache_long_side: int,
     logger: logging.Logger,
+    create_split_manifest: bool = True,
+    split_config: DataConfig = DataConfig(),
 ) -> tuple[list[ManifestItem], list[str]]:
     """Synchronize source images into a durable, tag-aware cache before splitting.
 
@@ -414,84 +418,152 @@ def audit_dataset(
         "Cache ready: %d reusable images, %d newly built", len(audited) - created_cache_count, created_cache_count
     )
 
+    if not create_split_manifest:
+        return [], available_tags
+
     manifest_path = task_log_dir / "split_manifest.jsonl"
     existing = _read_manifest(manifest_path)
-    existing_keys = {(item.source_rel_path, item.sha256): item for item in existing}
-    active_keys = {(item.source_rel_path, item.sha256) for item in audited}
-    additions: list[ManifestItem] = []
-    existing_active_by_tag: dict[str, list[ManifestItem]] = defaultdict(list)
-    new_by_tag: dict[str, list[AuditedImage]] = defaultdict(list)
-    for item in existing:
-        if (item.source_rel_path, item.sha256) in active_keys:
-            existing_active_by_tag[item.tag].append(item)
-    for item in audited:
-        if (item.source_rel_path, item.sha256) not in existing_keys:
-            new_by_tag[item.tag].append(item)
-
-    if not existing:
-        for tag in available_tags:
-            candidates = sorted(
-                (item for item in audited if item.tag == tag), key=lambda item: item.sha256
-            )
-            val_count = 0 if len(candidates) == 1 else max(1, math.floor(0.2 * len(candidates)))
-            for position, item in enumerate(candidates):
-                additions.append(
-                    ManifestItem(
-                        item.source_rel_path,
-                        item.cache_rel_path,
-                        item.sha256,
-                        item.tag,
-                        "val" if position < val_count else "train",
-                    )
-                )
-    else:
-        for tag in sorted(new_by_tag):
-            candidates = new_by_tag[tag]
-            old_items = existing_active_by_tag.get(tag, [])
-            old_train_count = sum(item.split == "train" for item in old_items)
-            old_val_count = sum(item.split == "val" for item in old_items)
-            for position, item in enumerate(sorted(candidates, key=lambda candidate: candidate.sha256)):
-                split = "val" if old_train_count == 1 and old_val_count == 0 and position == 0 else "train"
-                additions.append(
-                    ManifestItem(item.source_rel_path, item.cache_rel_path, item.sha256, item.tag, split)
-                )
-
-    if additions:
+    additions = _assign_new_splits(audited, existing, split_config)
+    if additions or not manifest_path.exists():
         _write_manifest(manifest_path, [*existing, *additions])
-    elif not manifest_path.exists():
-        _write_manifest(manifest_path, existing)
-
-    final_items = _read_manifest(manifest_path)
-    active = [item for item in final_items if (item.source_rel_path, item.sha256) in active_keys]
-    if len(active) != len(audited):
-        raise ProjectError("Split manifest does not cover every audited image")
+    assignments = {(item.tag, item.sha256): item.split for item in [*existing, *additions]}
+    # Content identity, not filename, prevents a rename from crossing split boundaries.
+    active = [
+        ManifestItem(item.source_rel_path, item.cache_rel_path, item.sha256, item.tag,
+                     assignments[(item.tag, item.sha256)])
+        for item in audited
+    ]
     logger.info(
-        "Audit complete: %d valid images, %d tags, %d train, %d val",
+        "Audit complete: %d valid images, %d tags, %d train, %d val, %d calibration, %d test",
         len(active),
         len(available_tags),
         sum(item.split == "train" for item in active),
         sum(item.split == "val" for item in active),
+        sum(item.split == "calibration" for item in active),
+        sum(item.split == "test" for item in active),
     )
     return active, available_tags
 
 
 
-def build_transforms(input_size: int) -> tuple[Callable[[Image.Image], torch.Tensor], Callable[[Image.Image], torch.Tensor]]:
+def _assign_new_splits(
+    audited: Sequence[AuditedImage], existing: Sequence[ManifestItem], config: DataConfig,
+) -> list[ManifestItem]:
+    """Allocate only unseen content; never promote previously trained data to holdout.
+
+    Validation receives the first scarce holdout slot, then test and calibration.
+    Existing assignments (including temporarily unavailable content) remain immutable.
+    ``stratified`` fills per-class target deficits using new images only. A class
+    with at least three images retains its configured training share and at
+    least two training examples where possible.
+    """
+    assignments: dict[tuple[str, str], str] = {}
+    digest_tags: dict[str, str] = {}
+    for item in existing:
+        key = (item.tag, item.sha256)
+        if key in assignments or (item.sha256 in digest_tags and digest_tags[item.sha256] != item.tag):
+            raise ProjectError("Split manifest contains duplicate or conflicting content identities")
+        assignments[key] = item.split
+        digest_tags[item.sha256] = item.tag
+    by_tag: dict[str, list[AuditedImage]] = defaultdict(list)
+    for item in audited:
+        if item.sha256 in digest_tags and digest_tags[item.sha256] != item.tag:
+            raise ProjectError("Previously assigned content changed tags; review the split manifest")
+        by_tag[item.tag].append(item)
+    additions: list[ManifestItem] = []
+    fractions = {"val": config.val_fraction, "calibration": config.calibration_fraction,
+                 "test": config.test_fraction}
+    for tag, candidates in sorted(by_tag.items()):
+        counts = {split: 0 for split in ("train", *fractions)}
+        unseen: list[AuditedImage] = []
+        for item in sorted(candidates, key=lambda item: item.sha256):
+            split = assignments.get((tag, item.sha256))
+            if split is None:
+                unseen.append(item)
+            else:
+                counts[split] += 1
+        minimum_train = (
+            max(2, math.ceil((1 - sum(fractions.values())) * len(candidates)))
+            if len(candidates) >= 3 else 1
+        )
+        while counts["train"] < minimum_train and unseen:
+            item = unseen.pop()
+            additions.append(ManifestItem(item.source_rel_path, item.cache_rel_path,
+                                          item.sha256, tag, "train"))
+            counts["train"] += 1
+        if counts["train"] == 0:
+            raise ProjectError(f"Class '{tag}' has no remaining train image; add new training data")
+        targets = {
+            split: (max(1, math.floor(fraction * len(candidates))) if fraction > 0 else 0)
+            for split, fraction in fractions.items()
+        }
+        for item in unseen:
+            split = "train"
+            if config.split_growth == "stratified" or not existing:
+                split = next((name for name in ("val", "test", "calibration")
+                              if counts[name] < targets[name]), "train")
+            elif counts["val"] == 0 and config.val_fraction > 0:
+                split = "val"  # Legacy minimum-one validation behaviour.
+            counts[split] += 1
+            additions.append(ManifestItem(item.source_rel_path, item.cache_rel_path,
+                                          item.sha256, tag, split))
+    return additions
+
+
+@dataclass(frozen=True)
+class SquareLetterbox:
+    """Resize without distortion or cropping and pad to a square in RGB space."""
+
+    size: int
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        return ImageOps.pad(image, (self.size, self.size), method=Image.Resampling.BILINEAR,
+                            color=tuple(round(value * 255) for value in IMAGENET_MEAN))
+
+
+def build_transforms(
+    input_size: int, *, config: DataConfig | None = None,
+) -> tuple[Callable[[Image.Image], torch.Tensor], Callable[[Image.Image], torch.Tensor]]:
+    """Build two-view training and deterministic evaluation preprocessing.
+
+    Defaults reproduce the original augmentation. Aspect-ratio preservation uses
+    letterboxing in both paths and must also be applied by registered inference.
+    """
+    config = config or DataConfig(input_size=input_size)
     normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+    strength = config.color_jitter_strength
+    spatial = [SquareLetterbox(input_size)] if config.preserve_aspect_ratio else []
     train_transform = transforms.Compose(
         [
-            transforms.RandomResizedCrop(input_size, scale=(0.70, 1.00), ratio=(0.90, 1.10)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([transforms.ColorJitter(0.20, 0.20, 0.20, 0.08)], p=0.8),
-            transforms.RandomApply([transforms.RandomGrayscale(p=1.0)], p=0.05),
+            *spatial,
+            transforms.RandomResizedCrop(
+                input_size, scale=(config.crop_min_scale, config.crop_max_scale),
+                ratio=(1.0, 1.0) if config.preserve_aspect_ratio
+                else (config.crop_min_ratio, config.crop_max_ratio),
+            ),
+            transforms.RandomHorizontalFlip(p=config.horizontal_flip_probability),
+            transforms.RandomApply(
+                [transforms.ColorJitter(
+                    config.color_jitter_brightness * strength,
+                    config.color_jitter_contrast * strength,
+                    config.color_jitter_saturation * strength,
+                    config.color_jitter_hue * strength,
+                )],
+                p=config.color_jitter_probability,
+            ),
+            transforms.RandomApply([transforms.RandomGrayscale(p=1.0)], p=config.grayscale_probability),
             transforms.ToTensor(),
-            transforms.RandomErasing(p=0.15, scale=(0.02, 0.12)),
+            transforms.RandomErasing(
+                p=config.erasing_probability,
+                scale=(config.erasing_min_scale, config.erasing_max_scale),
+            ),
             normalize,
         ]
     )
     eval_transform = transforms.Compose(
         [
-            transforms.Resize((input_size, input_size), antialias=True),
+            SquareLetterbox(input_size) if config.preserve_aspect_ratio
+            else transforms.Resize((input_size, input_size), antialias=True),
             transforms.ToTensor(),
             normalize,
         ]
@@ -544,16 +616,40 @@ class CachedImageDataset(Dataset[tuple[torch.Tensor, torch.Tensor] | tuple[torch
         return first, label
 
 
-class SqrtClassSampler(Sampler[int]):
-    """Replacement sampler with class probability proportional to sqrt(train count)."""
+class ClassBalancedSampler(Sampler[int]):
+    """Draw classes, cycling through their shuffled examples before reuse.
 
-    def __init__(self, items: Sequence[ManifestItem], tag_to_id: Mapping[str, int], seed: int, micro_batch: int) -> None:
+    ``sqrt`` preserves the original distribution; ``uniform`` gives each class the
+    same mass; ``effective_number`` applies per-example effective-number weights.
+    """
+
+    def __init__(
+        self, items: Sequence[ManifestItem], tag_to_id: Mapping[str, int], seed: int,
+        micro_batch: int, *, strategy: str = "sqrt", beta: float = 0.999,
+    ) -> None:
+        if not items or type(micro_batch) is not int or micro_batch < 1:
+            raise ProjectError("Sampler requires nonempty items and a positive micro_batch")
+        if strategy not in ("sqrt", "uniform", "effective_number"):
+            raise ProjectError(f"Unsupported class sampling strategy: {strategy}")
+        if type(beta) not in (int, float) or not math.isfinite(beta) or not 0 <= beta < 1:
+            raise ProjectError("Effective-number beta must be finite and in [0, 1)")
+        if any(item.tag not in tag_to_id for item in items):
+            raise ProjectError("Sampler items contain an unmapped tag")
         self.indices_by_tag: dict[str, list[int]] = defaultdict(list)
         for index, item in enumerate(items):
             self.indices_by_tag[item.tag].append(index)
         self.tags = sorted(self.indices_by_tag, key=lambda tag: tag_to_id[tag])
         counts = torch.tensor([len(self.indices_by_tag[tag]) for tag in self.tags], dtype=torch.float64)
-        self.probabilities = torch.sqrt(counts) / torch.sqrt(counts).sum()
+        if strategy == "sqrt":
+            weights = torch.sqrt(counts)
+        elif strategy == "uniform":
+            weights = torch.ones_like(counts)
+        elif beta == 0:
+            weights = counts
+        else:
+            # Class mass = n * per-example weight. expm1 avoids cancellation near beta=1.
+            weights = counts * (1 - beta) / (-torch.expm1(counts * math.log(beta)))
+        self.probabilities = weights / weights.sum()
         self.num_samples = max(len(items), micro_batch)
         self.seed = seed
         self.epoch = 0
@@ -564,13 +660,22 @@ class SqrtClassSampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         class_ids = torch.multinomial(self.probabilities, self.num_samples, replacement=True, generator=generator)
+        orders: dict[int, list[int]] = {}
+        offsets: dict[int, int] = {}
         for class_id in class_ids.tolist():
             samples = self.indices_by_tag[self.tags[class_id]]
-            position = torch.randint(len(samples), (1,), generator=generator).item()
-            yield samples[position]
+            if class_id not in orders or offsets[class_id] == len(samples):
+                orders[class_id] = torch.randperm(len(samples), generator=generator).tolist()
+                offsets[class_id] = 0
+            yield samples[orders[class_id][offsets[class_id]]]
+            offsets[class_id] += 1
 
     def __len__(self) -> int:
         return self.num_samples
+
+
+class SqrtClassSampler(ClassBalancedSampler):
+    """Backward-compatible sampler retaining the original sqrt defaults."""
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -587,6 +692,9 @@ def build_loader(
     seed: int,
     sampler: Sampler[int] | None = None,
     shuffle: bool | None = None,
+    persistent_workers: bool = True,
+    pin_memory: bool = True,
+    prefetch_factor: int = 1,
 ) -> DataLoader:
     generator = torch.Generator().manual_seed(seed)
     kwargs = {
@@ -595,18 +703,19 @@ def build_loader(
         "shuffle": sampler is None if shuffle is None else shuffle,
         "sampler": sampler,
         "num_workers": num_workers,
-        "pin_memory": True,
-        "persistent_workers": False,
+        "pin_memory": pin_memory,
+        # Keep reusable evaluation workers alive between epochs; training loaders are
+        # rebuilt each epoch for deterministic epoch-specific augmentation, so workers
+        # receive the usual epoch-specific seed and shut down with their loader.
+        "persistent_workers": num_workers > 0 and persistent_workers,
         "worker_init_fn": _seed_worker,
         "generator": generator,
     }
     if num_workers > 0:
-        kwargs["prefetch_factor"] = 1
+        kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(**kwargs)
 
 
 def source_paths(items: Iterable[ManifestItem], project_root: Path, dataset: str) -> list[Path]:
     dataset_root = project_root / "datasets" / dataset
     return [dataset_root / item.source_rel_path for item in items]
-
-

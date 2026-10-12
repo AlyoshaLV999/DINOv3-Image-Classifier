@@ -100,12 +100,16 @@ class MetricArcFaceModel(nn.Module):
         super().__init__()
         try:
             if load_pretrained_weights:
-                raw_backbone = AutoModel.from_pretrained(model_config.name, local_files_only=local_files_only)
+                raw_backbone = AutoModel.from_pretrained(
+                    model_config.name,
+                    local_files_only=local_files_only,
+                    attn_implementation="sdpa",
+                )
             else:
                 from transformers import AutoConfig
 
                 backbone_config = AutoConfig.from_pretrained(model_config.name, local_files_only=local_files_only)
-                raw_backbone = AutoModel.from_config(backbone_config)
+                raw_backbone = AutoModel.from_config(backbone_config, attn_implementation="sdpa")
         except Exception as error:
             location = "the local Hugging Face cache" if local_files_only else "Hugging Face"
             raise ProjectError(
@@ -234,5 +238,3 @@ class ParameterEMA:
         parameters = dict(model.named_parameters())
         for name, shadow in self.shadow.items():
             parameters[name].copy_(shadow.to(device=parameters[name].device))
-
-

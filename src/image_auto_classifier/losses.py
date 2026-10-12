@@ -22,7 +22,10 @@ class ArcMarginProduct(nn.Module):
         self.margin = margin
 
     def cosine_logits(self, embeddings: torch.Tensor) -> torch.Tensor:
-        return F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        # Angular margins and small temperature softmaxes are sensitive to FP16
+        # rounding, even when the backbone itself uses mixed precision.
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            return F.linear(F.normalize(embeddings.float()), F.normalize(self.weight.float()))
 
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         cosine = self.cosine_logits(embeddings).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
@@ -38,19 +41,21 @@ def supervised_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, te
     """SupCon objective for a flattened batch containing both views of each source."""
     if features.ndim != 2 or labels.ndim != 1 or features.shape[0] != labels.shape[0]:
         raise ValueError("features must be [N,D] and labels must be [N]")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
     if features.shape[0] < 2:
-        return features.new_zeros(())
-    features = F.normalize(features, dim=1)
-    logits = features @ features.T / temperature
-    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-    identity = torch.eye(features.shape[0], dtype=torch.bool, device=features.device)
-    positive_mask = labels[:, None].eq(labels[None, :]) & ~identity
-    logits_mask = ~identity
-    exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12))
-    positives_per_anchor = positive_mask.sum(dim=1)
-    valid = positives_per_anchor > 0
-    if not valid.any():
-        return features.new_zeros(())
-    mean_log_prob = (positive_mask * log_prob).sum(dim=1) / positives_per_anchor.clamp_min(1)
-    return -mean_log_prob[valid].mean()
+        return features.float().new_zeros(())
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        features = F.normalize(features.float(), dim=1)
+        logits = features @ features.T / temperature
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+        identity = torch.eye(features.shape[0], dtype=torch.bool, device=features.device)
+        positive_mask = labels[:, None].eq(labels[None, :]) & ~identity
+        exp_logits = torch.exp(logits) * ~identity
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12))
+        positives_per_anchor = positive_mask.sum(dim=1)
+        valid = positives_per_anchor > 0
+        if not valid.any():
+            return features.new_zeros(())
+        mean_log_prob = (positive_mask * log_prob).sum(dim=1) / positives_per_anchor.clamp_min(1)
+        return -mean_log_prob[valid].mean()
