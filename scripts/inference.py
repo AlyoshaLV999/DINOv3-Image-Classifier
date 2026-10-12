@@ -23,23 +23,30 @@ def main() -> int:
     )
     parser.add_argument("--input", default="input", help="First-level input image directory")
     parser.add_argument("--threshold", type=float, help="Override calibrated probability threshold")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Shared inference settings YAML (defaults to configs/inference.yaml)",
+    )
     args = parser.parse_args()
     input_dir = Path(args.input)
     if not input_dir.is_absolute():
         input_dir = PROJECT_ROOT / input_dir
     try:
-        accepted, rejected, active_csvs = run_inference(
+        accepted, rejected = run_inference(
             project_root=PROJECT_ROOT,
             dataset=args.dataset,
             input_dir=input_dir,
             probability_threshold=args.threshold,
+            inference_config_path=(
+                args.config if args.config is None or args.config.is_absolute()
+                else PROJECT_ROOT / args.config
+            ),
         )
-    except ProjectError as error:
+    except (ProjectError, ValueError, OSError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     print(f"accepted={accepted} rejected={rejected}")
-    for active_csv in active_csvs:
-        print(f"active_learning_csv={active_csv}")
     return 0
 
 
